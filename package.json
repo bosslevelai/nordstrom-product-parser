@@ -1,0 +1,14 @@
+{
+  "name": "nordstrom-product-parser",
+  "version": "1.0.0",
+  "description": "Fetch and parse Nordstrom product pages using Scrape.do",
+  "type": "module",
+  "main": "nordstrom_test.js",
+  "scripts": {
+    "start": "node nordstrom_test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
+
