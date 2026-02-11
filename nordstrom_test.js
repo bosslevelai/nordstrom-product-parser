@@ -1,44 +1,129 @@
 import * as cheerio from "cheerio";
 
 const SCRAPEDO_TOKEN = process.env.SCRAPEDO_TOKEN;
+
+// Toggle which URL you want to test
 const TARGET_URL =
   "https://www.nordstrom.com/s/pleated-cap-sleeve-charmeuse-gown/8058336";
 
-function buildScrapeDoUrl(url) {
+// Example search URL you shared (keep for testing search pages)
+// const TARGET_URL =
+//   "https://www.nordstrom.com/sr?origin=keywordsearch&keyword=navy%20turtleneck%20sweater&sid=75541";
+
+/**
+ * Build a Scrape.do request URL with configurable cost controls.
+ * opts:
+ * - super: boolean
+ * - render: boolean
+ * - blockResources: boolean
+ * - waitUntil: "domcontentloaded" | "load" | "networkidle0" | "networkidle2"
+ * - customWait: number (ms)
+ * - timeout: number (ms)
+ */
+function buildScrapeDoUrl(url, opts = {}) {
+  if (!SCRAPEDO_TOKEN) throw new Error("SCRAPEDO_TOKEN env var missing.");
+
+  const {
+    super: superProxy = false,
+    render = false,
+    blockResources = true,
+    waitUntil = "domcontentloaded",
+    customWait = 0,
+    timeout = 60000
+  } = opts;
+
   const u = new URL("https://api.scrape.do/");
   u.searchParams.set("token", SCRAPEDO_TOKEN);
   u.searchParams.set("url", url);
 
-  // Working toggles from your Scrape.do Playground
-  u.searchParams.set("super", "true");
-  u.searchParams.set("render", "true");
+  // Cost drivers
+  u.searchParams.set("super", superProxy ? "true" : "false");
+  u.searchParams.set("render", render ? "true" : "false");
 
-  // Leave false while validating price + images.
-  // Once stable, you can turn this back to true to reduce cost.
-  u.searchParams.set("blockResources", "false");
+  // Cost/speed helper (best ON for search pages; product pages can be ON too)
+  u.searchParams.set("blockResources", blockResources ? "true" : "false");
 
+  // Response
   u.searchParams.set("returnJSON", "true");
-  u.searchParams.set("waitUntil", "domcontentloaded");
-  u.searchParams.set("customWait", "6000");
-  u.searchParams.set("timeout", "60000");
+
+  // Load behavior
+  u.searchParams.set("waitUntil", waitUntil);
+  u.searchParams.set("customWait", String(customWait));
+  u.searchParams.set("timeout", String(timeout));
 
   return u.toString();
 }
 
-async function fetchPayload(url) {
-  const res = await fetch(buildScrapeDoUrl(url), {
-    headers: { accept: "application/json" }
-  });
+/**
+ * Fetch with an escalation ladder:
+ * 1) datacenter, no render
+ * 2) datacenter + render
+ * 3) super, no render
+ * 4) super + render
+ *
+ * We "accept" a page if it returns usable HTML and contains __NEXT_DATA__.
+ */
+async function fetchWithEscalation(url, { requireNextData = true } = {}) {
+  const tiers = [
+    {
+      name: "T1 datacenter no-render",
+      opts: { super: false, render: false, blockResources: true, customWait: 0 }
+    },
+    {
+      name: "T2 datacenter render",
+      opts: { super: false, render: true, blockResources: true, customWait: 1000 }
+    },
+    {
+      name: "T3 super no-render",
+      opts: { super: true, render: false, blockResources: true, customWait: 0 }
+    },
+    {
+      name: "T4 super render",
+      opts: { super: true, render: true, blockResources: true, customWait: 3000 }
+    }
+  ];
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Scrape.do failed: ${res.status} ${res.statusText}\n${text.slice(0, 300)}`
-    );
+  let lastErr = null;
+
+  for (const tier of tiers) {
+    try {
+      const reqUrl = buildScrapeDoUrl(url, tier.opts);
+      const res = await fetch(reqUrl, { headers: { accept: "application/json" } });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        lastErr = new Error(
+          `${tier.name} failed: ${res.status} ${res.statusText}\n${text.slice(
+            0,
+            250
+          )}`
+        );
+        continue;
+      }
+
+      const payload = await res.json();
+      const html = payload?.content;
+
+      if (typeof html !== "string" || html.length < 2000) {
+        lastErr = new Error(`${tier.name} failed: missing/short HTML`);
+        continue;
+      }
+
+      if (requireNextData && !html.includes("__NEXT_DATA__")) {
+        lastErr = new Error(`${tier.name} failed: missing __NEXT_DATA__`);
+        continue;
+      }
+
+      return { payload, html, tier: tier.name, tierOpts: tier.opts };
+    } catch (e) {
+      lastErr = e;
+    }
   }
 
-  return await res.json();
+  throw lastErr || new Error("All tiers failed.");
 }
+
+// -------------------- Existing parsing helpers (unchanged) --------------------
 
 function normalizeText(s) {
   return (s || "").replace(/\s+/g, " ").trim() || null;
@@ -91,10 +176,7 @@ function decodeHtmlEntities(url) {
 function isLikelyProductImage(url) {
   const u = url.toLowerCase();
 
-  // Must be Nordstrom product image host + path
   if (!u.includes("n.nordstrommedia.com/it/")) return false;
-
-  // Exclude non-product assets
   if (u.includes("nordstrom-logo")) return false;
   if (u.endsWith(".svg") || u.endsWith(".gif")) return false;
 
@@ -117,7 +199,7 @@ function extractProductImages(html) {
     }
   }
 
-  // De-dupe by removing &dpr= variations (keep one per base URL)
+  // De-dupe by removing &dpr= variations
   const deduped = new Map();
   for (const img of urls) {
     const base = img.replace(/([?&])dpr=\d+/g, "$1").replace(/[?&]$/, "");
@@ -127,16 +209,20 @@ function extractProductImages(html) {
   return Array.from(deduped.values());
 }
 
+// -------------------- Main --------------------
+
 async function main() {
-  if (!SCRAPEDO_TOKEN) throw new Error("SCRAPEDO_TOKEN env var missing.");
+  // Require __NEXT_DATA__ for both product pages + search pages
+  const { html, tier, tierOpts } = await fetchWithEscalation(TARGET_URL, {
+    requireNextData: true
+  });
 
-  const payload = await fetchPayload(TARGET_URL);
-  const html = payload?.content;
+  // Useful for cost estimation + reliability tracking
+  console.error(
+    `[scrape] success via ${tier} (super=${tierOpts.super}, render=${tierOpts.render}, blockResources=${tierOpts.blockResources})`
+  );
 
-  if (!html || typeof html !== "string") {
-    throw new Error("No HTML found in payload.content");
-  }
-
+  // If this is a product page, this prints product-ish data (same as before)
   const { canonical, title, ogImage } = parseMetaFromHtml(html);
   const price = tryPriceFromHtmlRegex(html);
 
