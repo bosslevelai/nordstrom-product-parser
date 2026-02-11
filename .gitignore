@@ -1,3 +1,7 @@
-node_modules
+node_modules/
 .env
+debug_search.html
+search_candidates.json
+search_candidates_enriched.json
+*.log
 .DS_Store
